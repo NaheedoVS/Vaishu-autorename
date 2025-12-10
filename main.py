@@ -1,9 +1,8 @@
 import os
 import asyncio
-import time
 from io import BytesIO
-from pyrogram import Client, filters, enums
-from pyrogram.types import Message
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message, BotCommand
 from motor.motor_asyncio import AsyncIOMotorClient
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
@@ -101,29 +100,17 @@ async def add_watermark(input_path, output_path, text):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text(f"Hey VaiSu! Welcome back.\n\nSend me files to rename.\nUse /cancel to stop a process.")
+    await message.reply_text(f"Hey VaiSu! Welcome back.\n\nI am ready to auto-rename files.\nCheck the menu button for commands.")
 
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_process(client, message):
-    user_id = message.from_user.id
-    if user_id in ongoing_tasks:
-        try:
-            task = ongoing_tasks[user_id]
-            task.cancel()
-            del ongoing_tasks[user_id]
-            await message.reply_text("❌ Process Cancelled!")
-        except Exception as e:
-            await message.reply_text(f"Failed to cancel: {e}")
-    else:
-        await message.reply_text("No active process to cancel.")
+@app.on_message(filters.command("autoname") & filters.private)
+async def set_autoname(client, message):
+    await update_user(message.from_user.id, "mode", "filename")
+    await message.reply_text("✅ Mode set: **Auto Rename from Filename**\n(I will keep the original name + your suffix)")
 
-@app.on_message(filters.command("mode") & filters.private)
-async def set_mode(client, message):
-    user = await get_user(message.from_user.id)
-    current = user.get("mode", DEFAULT_MODE)
-    new_mode = "caption" if current == "filename" else "filename"
-    await update_user(message.from_user.id, "mode", new_mode)
-    await message.reply_text(f"Rename mode changed to: **{new_mode}**")
+@app.on_message(filters.command("autocaption") & filters.private)
+async def set_autocaption(client, message):
+    await update_user(message.from_user.id, "mode", "caption")
+    await message.reply_text("✅ Mode set: **Auto Rename from Caption**\n(I will use the caption as the new filename)")
 
 @app.on_message(filters.command("suffix") & filters.private)
 async def set_suffix(client, message):
@@ -142,6 +129,20 @@ async def set_pdf_mark(client, message):
     text = message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "watermark_text", text)
     await message.reply_text(f"PDF Watermark text set to: `{text}`")
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_process(client, message):
+    user_id = message.from_user.id
+    if user_id in ongoing_tasks:
+        try:
+            task = ongoing_tasks[user_id]
+            task.cancel()
+            del ongoing_tasks[user_id]
+            await message.reply_text("❌ Process Cancelled!")
+        except Exception as e:
+            await message.reply_text(f"Failed to cancel: {e}")
+    else:
+        await message.reply_text("No active process to cancel.")
 
 @app.on_message(filters.photo & filters.private)
 async def save_thumbnail(client, message):
@@ -250,5 +251,25 @@ async def incoming_file(client, message):
     try: await task
     except asyncio.CancelledError: pass 
 
-print("Bot Started...")
-app.run()
+# --- RUN BOT ---
+
+async def main():
+    await app.start()
+    print("Bot Started!")
+    
+    # SET COMMANDS IN MENU
+    await app.set_bot_commands([
+        BotCommand("start", "Start Bot"),
+        BotCommand("autoname", "Mode: Rename via Filename"),
+        BotCommand("autocaption", "Mode: Rename via Caption"),
+        BotCommand("suffix", "Set custom suffix"),
+        BotCommand("pdfmark", "Set PDF Watermark"),
+        BotCommand("delthumb", "Delete Thumbnail"),
+        BotCommand("cancel", "Cancel current task")
+    ])
+    
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    app.run(main())
