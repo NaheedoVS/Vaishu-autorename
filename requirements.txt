@@ -1,0 +1,8 @@
+pyrogram
+tgcrypto
+motor
+dnspython
+pypdf
+reportlab
+aiofiles
+hachoir
