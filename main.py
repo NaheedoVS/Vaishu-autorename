@@ -3,7 +3,7 @@ import asyncio
 import time
 from io import BytesIO
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message, DocumentAttributeVideo
+from pyrogram.types import Message
 from motor.motor_asyncio import AsyncIOMotorClient
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
@@ -28,7 +28,11 @@ app = Client("rename_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 # --- GLOBAL VARS ---
 DEFAULT_SUFFIX = " 🦋Vaiᡣ𐭩Su×@pglinsan2"
 DEFAULT_MODE = "filename"
-ongoing_tasks = {} # Tracks active tasks for cancellation
+ongoing_tasks = {} 
+
+# --- CRITICAL FIX: CREATE FOLDER ---
+if not os.path.isdir("downloads"):
+    os.makedirs("downloads")
 
 # --- HELPERS ---
 
@@ -48,33 +52,21 @@ async def get_user(user_id):
 async def update_user(user_id, key, value):
     await users_col.update_one({"_id": user_id}, {"$set": {key: value}}, upsert=True)
 
-# Function to get video duration and dimensions
 def get_metadata(file_path):
     try:
         parser = createParser(file_path)
-        if not parser:
-            return 0, 0, 0
+        if not parser: return 0, 0, 0
         metadata = extractMetadata(parser)
-        if not metadata:
-            return 0, 0, 0
+        if not metadata: return 0, 0, 0
         
-        duration = 0
-        if metadata.has("duration"):
-            duration = metadata.get("duration").seconds
-            
-        width = 0
-        if metadata.has("width"):
-            width = metadata.get("width")
-            
-        height = 0
-        if metadata.has("height"):
-            height = metadata.get("height")
+        duration = metadata.get("duration").seconds if metadata.has("duration") else 0
+        width = metadata.get("width") if metadata.has("width") else 0
+        height = metadata.get("height") if metadata.has("height") else 0
             
         return duration, width, height
     except:
         return 0, 0, 0
 
-# PDF Watermark Logic
 def create_watermark(text):
     packet = BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
@@ -117,7 +109,7 @@ async def cancel_process(client, message):
     if user_id in ongoing_tasks:
         try:
             task = ongoing_tasks[user_id]
-            task.cancel() # Cancel the asyncio task
+            task.cancel()
             del ongoing_tasks[user_id]
             await message.reply_text("❌ Process Cancelled!")
         except Exception as e:
@@ -142,6 +134,15 @@ async def set_suffix(client, message):
     await update_user(message.from_user.id, "suffix", new_suffix)
     await message.reply_text(f"Suffix updated to: `{new_suffix}`")
 
+@app.on_message(filters.command("pdfmark") & filters.private)
+async def set_pdf_mark(client, message):
+    if len(message.command) < 2:
+        await message.reply_text("Send `/pdfmark <text>` to set the watermark text for PDFs.")
+        return
+    text = message.text.split(None, 1)[1]
+    await update_user(message.from_user.id, "watermark_text", text)
+    await message.reply_text(f"PDF Watermark text set to: `{text}`")
+
 @app.on_message(filters.photo & filters.private)
 async def save_thumbnail(client, message):
     await update_user(message.from_user.id, "thumb", message.photo.file_id)
@@ -152,7 +153,7 @@ async def delete_thumbnail(client, message):
     await update_user(message.from_user.id, "thumb", None)
     await message.reply_text("Thumbnail deleted.")
 
-# --- CORE RENAME LOGIC ---
+# --- CORE LOGIC ---
 
 async def process_file(client, message):
     user_id = message.from_user.id
@@ -169,7 +170,7 @@ async def process_file(client, message):
         media = message.document or message.video or message.audio
         original_filename = media.file_name or "Unknown_File"
         
-        # Determine New Name
+        # New Name Logic
         if mode == "caption" and message.caption:
             base_name = message.caption
         else:
@@ -177,7 +178,6 @@ async def process_file(client, message):
             
         extension = os.path.splitext(original_filename)[1]
         if not extension:
-            # Fallback if extension is missing
             extension = ".mp4" if message.video else ".mkv"
             
         new_filename = f"{base_name}{suffix}{extension}"
@@ -187,8 +187,7 @@ async def process_file(client, message):
         path = await message.download(file_name=final_path)
 
         # PDF Logic
-        is_pdf = extension.lower() == ".pdf"
-        if is_pdf:
+        if extension.lower() == ".pdf":
             wm_text = user_data.get("watermark_text")
             if wm_text:
                 await status_msg.edit("📝 Applying PDF Watermark...")
@@ -200,20 +199,15 @@ async def process_file(client, message):
 
         await status_msg.edit("⬆️ Uploading...")
 
-        # Metadata & Thumbnail
-        duration = 0
-        width = 0
-        height = 0
-        
-        # Download User Thumbnail
+        # Metadata
+        duration, width, height = 0, 0, 0
         if thumb_id:
             thumb_path = await client.download_media(thumb_id)
         
-        # If it's a video, extract correct duration/width/height
         if extension.lower() in [".mp4", ".mkv", ".avi", ".mov", ".webm"]:
             duration, width, height = get_metadata(final_path)
 
-        # Sending...
+        # Send
         if extension.lower() in [".mp4", ".mkv"]:
              await client.send_video(
                 chat_id=message.chat.id,
@@ -226,7 +220,6 @@ async def process_file(client, message):
                 supports_streaming=True
             )
         else:
-            # Send as document (PDFs, etc)
             await client.send_document(
                 chat_id=message.chat.id,
                 document=final_path,
@@ -238,31 +231,24 @@ async def process_file(client, message):
         await status_msg.delete()
 
     except asyncio.CancelledError:
-        # User cancelled
-        await status_msg.edit("❌ Cancelled by user.")
+        await status_msg.edit("❌ Cancelled.")
     except Exception as e:
         await status_msg.edit(f"Error: {e}")
     finally:
-        # Cleanup
         if final_path and os.path.exists(final_path): os.remove(final_path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-        # Remove from active tasks
         if user_id in ongoing_tasks: del ongoing_tasks[user_id]
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def incoming_file(client, message):
     if message.from_user.id in ongoing_tasks:
-        await message.reply_text("Please wait for the current process to finish or use /cancel.")
+        await message.reply_text("Wait for current process or /cancel.")
         return
 
-    # Create an asyncio task for the process
     task = asyncio.create_task(process_file(client, message))
     ongoing_tasks[message.from_user.id] = task
-    
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass 
+    try: await task
+    except asyncio.CancelledError: pass 
 
 print("Bot Started...")
 app.run()
