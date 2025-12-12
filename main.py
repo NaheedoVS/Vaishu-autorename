@@ -4,14 +4,10 @@ import math
 import asyncio
 import re
 import aiofiles
-from io import BytesIO
-from pyrogram import Client, filters, idle, raw, utils
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, MessageNotModified
 from motor.motor_asyncio import AsyncIOMotorClient
-from pypdf import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
@@ -38,7 +34,7 @@ CURRENT_TASK = {}
 if not os.path.isdir("downloads"):
     os.makedirs("downloads")
 
-# --- 1. PROGRESS BAR (1 Minute Timer) ---
+# --- 1. PROGRESS BAR ---
 
 def humanbytes(size):
     if not size: return ""
@@ -58,8 +54,6 @@ def time_formatter(seconds):
 async def progress_bar(current, total, status_msg, action_text, start_time):
     try:
         now = time.time()
-        
-        # --- STRICT 1 MINUTE TIMER ---
         if (now - progress_bar.last_update_time) < 60 and current != total:
             return
 
@@ -87,71 +81,58 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
 
 progress_bar.last_update_time = 0
 
-# --- 2. SINGLE-THREADED DOWNLOAD ENGINE ---
+# --- 2. ROBUST UPLOAD WRAPPER (Standard Pyrogram) ---
 
-async def fast_download(client: Client, message: Message, file_path: str, status_msg, start_time):
-    await message.download(
-        file_name=file_path,
-        progress=progress_bar,
-        progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
-    )
-    return file_path
-
-# --- 3. ROBUST UPLOAD ENGINE (FIXED) ---
-
-async def fast_upload(client: Client, file_path: str, status_msg, start_time):
-    file_size = os.path.getsize(file_path)
-    file_name = os.path.basename(file_path)
-    file_id = client.rnd_id()
+async def upload_file(client, message, file_path, thumb_path, caption, duration, width, height, status_msg, start_time):
+    """
+    Tries to upload the file using standard Pyrogram methods with retries for stability.
+    """
+    retries = 3
+    attempt = 0
     
-    # CHANGED: Reduced Chunk Size to 512KB for Stability on Heroku
-    CHUNK_SIZE = 512 * 1024 
-    
-    part_count = math.ceil(file_size / CHUNK_SIZE)
-    uploaded_bytes = 0
-    
-    for part_index in range(part_count):
-        # Retry loop for each chunk (max 3 retries)
-        retries = 3
-        while retries > 0:
-            try:
-                async with aiofiles.open(file_path, "rb") as f:
-                    await f.seek(part_index * CHUNK_SIZE)
-                    chunk = await f.read(CHUNK_SIZE)
-                
-                # Try uploading
-                await client.invoke(
-                    raw.functions.upload.SaveBigFilePart(
-                        file_id=file_id,
-                        file_part=part_index,
-                        file_total_parts=part_count,
-                        bytes=chunk
-                    )
+    while attempt < retries:
+        try:
+            attempt += 1
+            if file_path.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".webm")):
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=file_path,
+                    caption=caption,
+                    thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    supports_streaming=True,
+                    progress=progress_bar,
+                    progress_args=(status_msg, "⬆️ **Uploading...**", start_time)
                 )
-                
-                uploaded_bytes += len(chunk)
-                await progress_bar(uploaded_bytes, file_size, status_msg, "⬆️ **Uploading...**", start_time)
-                
-                # Success - break retry loop and move to next part
-                break 
-                
-            except FloodWait as e:
-                # If Telegram says wait, we wait
-                print(f"FloodWait: Sleeping {e.value}s")
-                await asyncio.sleep(e.value)
-                # Don't decrease retries for FloodWait, just retry
-                continue
-                
-            except Exception as e:
-                retries -= 1
-                print(f"Upload Error (Part {part_index}): {e}. Retrying... ({retries} left)")
-                await asyncio.sleep(2) # Wait 2s before retry
-                
-                if retries == 0:
-                    # If all retries failed, raise the error to cancel the process
-                    raise e
-
-    return raw.types.InputFileBig(id=file_id, parts=part_count, name=file_name)
+            else:
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+                    caption=caption,
+                    force_document=True,
+                    progress=progress_bar,
+                    progress_args=(status_msg, "⬆️ **Uploading...**", start_time)
+                )
+            # If successful, break the loop
+            return 
+            
+        except FloodWait as e:
+            print(f"FloodWait: Sleeping {e.value}s")
+            await status_msg.edit(f"😴 **Sleeping for {e.value}s (FloodWait)...**")
+            await asyncio.sleep(e.value)
+            attempt -= 1 # FloodWait shouldn't count as a failed retry
+            continue
+            
+        except Exception as e:
+            print(f"Upload Attempt {attempt} Failed: {e}")
+            if attempt < retries:
+                await status_msg.edit(f"⚠️ **Upload Failed (Attempt {attempt}/{retries}). Retrying...**\nError: `{e}`")
+                await asyncio.sleep(5)
+            else:
+                raise e # Re-raise error if all retries fail
 
 # --- HELPERS ---
 
@@ -163,7 +144,6 @@ async def get_user(user_id):
             "suffix": DEFAULT_SUFFIX, 
             "mode": DEFAULT_MODE, 
             "thumb": None, 
-            "watermark_text": "Protected",
             "removal_words": [] 
         }
         await users_col.insert_one(user)
@@ -184,33 +164,6 @@ def get_metadata(file_path):
         return duration, width, height
     except:
         return 0, 0, 0
-
-def add_watermark_sync(input_path, output_path, text):
-    try:
-        packet = BytesIO()
-        can = canvas.Canvas(packet, pagesize=letter)
-        can.setFont("Helvetica-Bold", 36)
-        can.setFillColorRGB(0.5, 0.5, 0.5, 0.5)
-        can.saveState()
-        can.translate(300, 400)
-        can.rotate(45)
-        can.drawCentredString(0, 0, text)
-        can.restoreState()
-        can.save()
-        packet.seek(0)
-        watermark_pdf = PdfReader(packet)
-        watermark_page = watermark_pdf.pages[0]
-        reader = PdfReader(input_path)
-        writer = PdfWriter()
-        for page in reader.pages:
-            page.merge_page(watermark_page)
-            writer.add_page(page)
-        with open(output_path, "wb") as f:
-            writer.write(f)
-        return True
-    except: return False
-
-# --- TEXT CLEANER ---
 
 def clean_filename_text(text, removal_list):
     if not text: return "File"
@@ -267,13 +220,6 @@ async def set_remove_words(client, message):
 async def reset_remove_words(client, message):
     await update_user(message.from_user.id, "removal_words", [])
     await message.reply_text("🗑️ **Removal List Cleared.**")
-
-@app.on_message(filters.command("pdfmark") & filters.private)
-async def set_pdf_mark(client, message):
-    text = message.text.split(None, 1)[1] if len(message.command) > 1 else None
-    if not text: return
-    await update_user(message.from_user.id, "watermark_text", text)
-    await message.reply_text(f"✅ PDF Watermark set: `{text}`")
 
 @app.on_message(filters.command("delthumb") & filters.private)
 async def delete_thumbnail(client, message):
@@ -371,16 +317,12 @@ async def process_file_logic(client, message):
         await status_msg.edit(f"⬇️ **Downloading:** `{new_filename}`")
         
         start_time = time.time()
-        await fast_download(client, message, final_path, status_msg, start_time)
-
-        if extension.lower() == ".pdf" and user_data.get("watermark_text"):
-            await status_msg.edit("📝 **Applying Watermark...**")
-            wm_path = os.path.join("downloads", f"WM_{new_filename}")
-            loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(None, add_watermark_sync, final_path, wm_path, user_data.get("watermark_text"))
-            if success:
-                os.remove(final_path)
-                final_path = wm_path
+        # Using standard download to avoid chunk issues
+        await message.download(
+            file_name=final_path,
+            progress=progress_bar,
+            progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
+        )
 
         if custom_thumb_id:
             thumb_path = await client.download_media(custom_thumb_id)
@@ -392,30 +334,10 @@ async def process_file_logic(client, message):
             duration, width, height = get_metadata(final_path)
 
         start_time = time.time()
-        uploaded_file = await fast_upload(client, final_path, status_msg, start_time)
         
-        await status_msg.edit("🔄 **Processing Final File...**")
+        # Call the Robust Upload Wrapper
+        await upload_file(client, message, final_path, thumb_path, new_filename, duration, width, height, status_msg, start_time)
         
-        if extension.lower() in [".mp4", ".mkv"]:
-             await client.send_video(
-                chat_id=message.chat.id,
-                video=uploaded_file,
-                caption=new_filename,
-                thumb=thumb_path,
-                duration=duration,
-                width=width,
-                height=height,
-                supports_streaming=True
-            )
-        else:
-            await client.send_document(
-                chat_id=message.chat.id,
-                document=uploaded_file,
-                thumb=thumb_path,
-                caption=new_filename,
-                force_document=True
-            )
-
         await status_msg.delete()
 
     except asyncio.CancelledError:
@@ -432,5 +354,5 @@ async def incoming_file(client, message):
     await queue_handler(client, message)
 
 if __name__ == "__main__":
-    print("🤖 Bot Starting with Robust Engine...")
+    print("🤖 Bot Starting with Robust Standard Engine...")
     app.run()
