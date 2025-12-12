@@ -84,108 +84,56 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
 
 progress_bar.last_update_time = 0
 
-# --- 2. FAST DOWNLOAD ENGINE (Multi-Threaded) ---
+# --- 2. SINGLE-THREADED DOWNLOAD ENGINE ---
 
 async def fast_download(client: Client, message: Message, file_path: str, status_msg, start_time):
-    # Get the file location reference
-    media = message.document or message.video or message.audio or message.photo
-    file_id = media.file_id
-    file_size = media.file_size
-    
-    # Use Pyrogram's internal utility to get the raw location
-    # Note: We need a fresh file_reference. 
-    # Calling get_file_ids gives us the location needed for Raw API
-    file_details = await client.get_messages(message.chat.id, message.id)
-    media = file_details.document or file_details.video or file_details.audio
-    
-    # Determine Chunk Size & Workers
-    MAX_WORKERS = 4
-    CHUNK_SIZE = 1024 * 1024 # 1MB chunks for download requests
-    
-    # Create the file
-    f = open(file_path, "wb")
-    f.seek(file_size - 1)
-    f.write(b"\0")
-    f.close()
-    
-    # Download Logic
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
-    downloaded_bytes = 0
-    
-    async def download_chunk(offset, length):
-        nonlocal downloaded_bytes
-        async with semaphore:
-            # We use the standard client.stream_media but seek to specific offsets
-            # Ideally we use raw.functions.upload.GetFile, but stream_media is more stable with file_ids
-            # For true parallel download, we iterate chunks
-            async for chunk in client.stream_media(media, offset=offset, limit=length):
-                async with aiofiles.open(file_path, "r+b") as f:
-                    await f.seek(offset)
-                    await f.write(chunk)
-                
-                downloaded_bytes += len(chunk)
-                await progress_bar(downloaded_bytes, file_size, status_msg, "⬇️ **Fast Downloading...**", start_time)
-
-    # Splitting logic is complex for stream_media, so we stick to a simpler chunked approach
-    # or rely on Pyrogram's smart download but force larger buffers.
-    # HOWEVER, since you asked for custom multi-thread:
-    
-    # We will use the 'message.download' but with this trick:
-    # Pyrogram doesn't natively support multi-thread download easily without low-level hacks.
-    # The safest "fast" way is standard download with optimized buffers.
-    # But below is the standard download. I will use the standard one because
-    # writing a custom MTProto parallel downloader from scratch is extremely unstable
-    # and often results in corrupt files.
-    
-    # INSTEAD, we optimize the standard download:
+    # Standard Pyrogram download is usually single-threaded and stable
+    # We removed the chunk/stream logic to ensure single-thread stability
     await message.download(
         file_name=file_path,
         progress=progress_bar,
-        progress_args=(status_msg, "⬇️ **Fast Downloading...**", start_time)
+        progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
     )
     return file_path
 
-# --- 3. FAST UPLOAD ENGINE (Multi-Threaded) ---
+# --- 3. SINGLE-THREADED UPLOAD ENGINE ---
 
 async def fast_upload(client: Client, file_path: str, status_msg, start_time):
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
     file_id = client.rnd_id()
     
-    MAX_WORKERS = 4 
+    # Chunk size can remain large for efficiency, but we process one at a time
     CHUNK_SIZE = 2 * 1024 * 1024 # 2MB
     
     part_count = math.ceil(file_size / CHUNK_SIZE)
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
     uploaded_bytes = 0
     
-    async def upload_chunk(part_index):
-        nonlocal uploaded_bytes
-        async with semaphore:
-            try:
-                async with aiofiles.open(file_path, "rb") as f:
-                    await f.seek(part_index * CHUNK_SIZE)
-                    chunk = await f.read(CHUNK_SIZE)
-                
-                await client.invoke(
-                    raw.functions.upload.SaveBigFilePart(
-                        file_id=file_id,
-                        file_part=part_index,
-                        file_total_parts=part_count,
-                        bytes=chunk
-                    )
+    # Loop strictly sequentially
+    for part_index in range(part_count):
+        try:
+            async with aiofiles.open(file_path, "rb") as f:
+                await f.seek(part_index * CHUNK_SIZE)
+                chunk = await f.read(CHUNK_SIZE)
+            
+            # Upload the part
+            await client.invoke(
+                raw.functions.upload.SaveBigFilePart(
+                    file_id=file_id,
+                    file_part=part_index,
+                    file_total_parts=part_count,
+                    bytes=chunk
                 )
-                uploaded_bytes += len(chunk)
-                await progress_bar(uploaded_bytes, file_size, status_msg, "⬆️ **Fast Uploading...**", start_time)
-            except Exception as e:
-                # Basic retry
-                await asyncio.sleep(2)
-                # Retry once
-                # (Ideally you would recursively call or loop here)
-                pass 
-
-    tasks = [asyncio.create_task(upload_chunk(i)) for i in range(part_count)]
-    await asyncio.gather(*tasks)
+            )
+            
+            uploaded_bytes += len(chunk)
+            await progress_bar(uploaded_bytes, file_size, status_msg, "⬆️ **Uploading...**", start_time)
+            
+        except Exception as e:
+            print(f"Error uploading part {part_index}: {e}")
+            # In single thread, if one fails, the whole upload usually fails.
+            # You could add a retry loop here if needed.
+            raise e
 
     return raw.types.InputFileBig(id=file_id, parts=part_count, name=file_name)
 
@@ -243,7 +191,7 @@ def add_watermark_sync(input_path, output_path, text):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("Hey! Send me files. I will queue them and rename them using Multi-Threaded Speed! ⚡")
+    await message.reply_text("Hey! Send me files. I will queue them and rename them using Single-Threaded Stability! 🛡️")
 
 @app.on_message(filters.command("autoname") & filters.private)
 async def set_autoname(client, message):
@@ -359,13 +307,8 @@ async def process_file_logic(client, message):
         
         # --- DOWNLOAD ---
         start_time = time.time()
-        # Using standard download as it's the safest robust way to get files.
-        # Custom parallel downloading FROM Telegram is highly unstable.
-        await message.download(
-            file_name=final_path,
-            progress=progress_bar,
-            progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
-        )
+        # Single-Threaded download
+        await fast_download(client, message, final_path, status_msg, start_time)
 
         if extension.lower() == ".pdf" and user_data.get("watermark_text"):
             await status_msg.edit("📝 **Applying Watermark...**")
@@ -388,6 +331,7 @@ async def process_file_logic(client, message):
 
         # --- FAST UPLOAD ---
         start_time = time.time()
+        # Single-Threaded Upload
         uploaded_file = await fast_upload(client, final_path, status_msg, start_time)
         
         await status_msg.edit("🔄 **Processing Final File...**")
@@ -428,5 +372,5 @@ async def incoming_file(client, message):
     await queue_handler(client, message)
 
 if __name__ == "__main__":
-    print("🤖 Bot Starting with Optimized Engine...")
+    print("🤖 Bot Starting with Single-Threaded Engine...")
     app.run()
