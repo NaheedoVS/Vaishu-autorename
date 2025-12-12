@@ -13,10 +13,11 @@ from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
 # --- CONFIGURATION ---
-API_ID = int(os.environ.get("API_ID", "123456")) 
-API_HASH = os.environ.get("API_HASH", "your_hash")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_token")
-MONGO_URL = os.environ.get("MONGO_URL", "your_mongo_url") # <--- Kept as MONGO_URL
+# Load variables. If missing, it will crash safely instead of using fake URLs.
+API_ID = int(os.environ.get("API_ID", "0")) 
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URL = os.environ.get("MONGO_URL")
 
 # --- DATABASE SETUP ---
 mongo = AsyncIOMotorClient(MONGO_URL)
@@ -54,7 +55,7 @@ def time_formatter(seconds):
 async def progress_bar(current, total, status_msg, action_text, start_time):
     try:
         now = time.time()
-        # Update only every 5 seconds to avoid FloodWait (Telegram limit)
+        # Update every 5 seconds
         if (now - progress_bar.last_update_time) < 5 and current != total:
             return
 
@@ -62,7 +63,6 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
         speed = current / (now - start_time) if (now - start_time) > 0 else 1
         eta = (total - current) / speed if speed > 0 else 0
         
-        # Draw Bar
         bar_length = 10
         filled_length = int(bar_length * percentage / 100)
         bar = '■' * filled_length + '□' * (bar_length - filled_length)
@@ -78,7 +78,6 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
     except Exception:
         pass
 
-# Initialize static variable for progress bar
 progress_bar.last_update_time = 0
 
 # --- HELPERS ---
@@ -114,24 +113,21 @@ def get_metadata(file_path):
     except:
         return 0, 0, 0
 
-def create_watermark(text):
-    packet = BytesIO()
-    can = canvas.Canvas(packet, pagesize=letter)
-    can.setFont("Helvetica-Bold", 36)
-    can.setFillColorRGB(0.5, 0.5, 0.5, 0.5)
-    can.saveState()
-    can.translate(300, 400)
-    can.rotate(45)
-    can.drawCentredString(0, 0, text)
-    can.restoreState()
-    can.save()
-    packet.seek(0)
-    return PdfReader(packet)
-
-async def add_watermark(input_path, output_path, text):
+# Sync function for Threading
+def add_watermark_sync(input_path, output_path, text):
     try:
-        # NOTE: This is blocking. For large PDFs, consider running in executor (as discussed before)
-        watermark_pdf = create_watermark(text)
+        packet = BytesIO()
+        can = canvas.Canvas(packet, pagesize=letter)
+        can.setFont("Helvetica-Bold", 36)
+        can.setFillColorRGB(0.5, 0.5, 0.5, 0.5)
+        can.saveState()
+        can.translate(300, 400)
+        can.rotate(45)
+        can.drawCentredString(0, 0, text)
+        can.restoreState()
+        can.save()
+        packet.seek(0)
+        watermark_pdf = PdfReader(packet)
         watermark_page = watermark_pdf.pages[0]
         reader = PdfReader(input_path)
         writer = PdfWriter()
@@ -149,75 +145,77 @@ async def add_watermark(input_path, output_path, text):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text(f"Hey VaiSu! Welcome back.\n\nI am ready to auto-rename files.\nCheck the menu button for commands.")
+    await message.reply_text("Hey! I am ready. Send me a file.")
 
 @app.on_message(filters.command("autoname") & filters.private)
 async def set_autoname(client, message):
     await update_user(message.from_user.id, "mode", "filename")
-    # CONFIRMATION MESSAGE
-    await message.reply_text(
-        "✅ **Settings Updated Successfully!**\n\n"
-        "**Mode:** Auto Rename from Filename\n"
-        "**Action:** I will keep the original filename and append your suffix."
-    )
+    await message.reply_text("✅ **Mode Set:** Filename + Suffix")
 
 @app.on_message(filters.command("autocaption") & filters.private)
 async def set_autocaption(client, message):
     await update_user(message.from_user.id, "mode", "caption")
-    # CONFIRMATION MESSAGE
-    await message.reply_text(
-        "✅ **Settings Updated Successfully!**\n\n"
-        "**Mode:** Auto Rename from Caption\n"
-        "**Action:** I will use the file's caption as the new filename."
-    )
+    await message.reply_text("✅ **Mode Set:** Caption as Filename")
 
 @app.on_message(filters.command("suffix") & filters.private)
 async def set_suffix(client, message):
     if len(message.command) < 2:
-        await message.reply_text(f"Current suffix: `{DEFAULT_SUFFIX}`\nTo change: `/suffix <new text>`")
+        await message.reply_text(f"Current suffix: `{DEFAULT_SUFFIX}`\nUsage: `/suffix <text>`")
         return
     new_suffix = " " + message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "suffix", new_suffix)
-    await message.reply_text(f"✅ Suffix updated to: `{new_suffix}`")
+    await message.reply_text(f"✅ Suffix set to: `{new_suffix}`")
 
 @app.on_message(filters.command("pdfmark") & filters.private)
 async def set_pdf_mark(client, message):
-    if len(message.command) < 2:
-        await message.reply_text("Send `/pdfmark <text>` to set the watermark text for PDFs.")
+    text = message.text.split(None, 1)[1] if len(message.command) > 1 else None
+    if not text:
+        await message.reply_text("Usage: `/pdfmark <text>`")
         return
-    text = message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "watermark_text", text)
-    await message.reply_text(f"✅ PDF Watermark text set to: `{text}`")
-
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_process(client, message):
-    user_id = message.from_user.id
-    if user_id in ongoing_tasks:
-        try:
-            task = ongoing_tasks[user_id]
-            task.cancel()
-            del ongoing_tasks[user_id]
-            await message.reply_text("❌ Process Cancelled!")
-        except Exception as e:
-            await message.reply_text(f"Failed to cancel: {e}")
-    else:
-        await message.reply_text("No active process to cancel.")
-
-@app.on_message(filters.photo & filters.private)
-async def save_thumbnail(client, message):
-    await update_user(message.from_user.id, "thumb", message.photo.file_id)
-    await message.reply_text("✅ Thumbnail saved successfully!")
+    await message.reply_text(f"✅ PDF Watermark set: `{text}`")
 
 @app.on_message(filters.command("delthumb") & filters.private)
 async def delete_thumbnail(client, message):
     await update_user(message.from_user.id, "thumb", None)
-    await message.reply_text("🗑️ Thumbnail deleted.")
+    await message.reply_text("🗑️ **Thumbnail Deleted.**\nI will now use the original video's thumbnail.")
+
+@app.on_message(filters.command("viewthumb") & filters.private)
+async def view_thumbnail(client, message):
+    user_data = await get_user(message.from_user.id)
+    thumb_id = user_data.get("thumb")
+    if thumb_id:
+        await client.send_photo(chat_id=message.chat.id, photo=thumb_id, caption="🖼️ This is your custom thumbnail.")
+    else:
+        await message.reply_text("❌ You have no custom thumbnail set.\n(I am using the original file's thumbnail).")
+
+# --- SAVE THUMBNAIL (Photo Handler) ---
+@app.on_message(filters.photo & filters.private)
+async def save_thumbnail(client, message):
+    # This captures PHOTOS sent to the bot
+    await update_user(message.from_user.id, "thumb", message.photo.file_id)
+    await message.reply_text(
+        "✅ **Thumbnail Saved!**\n\n"
+        "I will use this photo for all future uploads.\n"
+        "To delete it, use /delthumb"
+    )
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_process(client, message):
+    if message.from_user.id in ongoing_tasks:
+        try:
+            ongoing_tasks[message.from_user.id].cancel()
+        except: pass
+        del ongoing_tasks[message.from_user.id]
+        await message.reply_text("❌ Task Cancelled.")
+    else:
+        await message.reply_text("No active task.")
 
 # --- CORE LOGIC ---
 
 async def process_file(client, message):
     user_id = message.from_user.id
-    status_msg = await message.reply_text("⬇️ **Initiating Download...**")
+    status_msg = await message.reply_text("⬇️ **Initiating...**")
     final_path = None
     thumb_path = None
     
@@ -225,13 +223,16 @@ async def process_file(client, message):
         user_data = await get_user(user_id)
         suffix = user_data.get("suffix", DEFAULT_SUFFIX)
         mode = user_data.get("mode", DEFAULT_MODE)
-        thumb_id = user_data.get("thumb")
+        custom_thumb_id = user_data.get("thumb")
 
         media = message.document or message.video or message.audio
         original_filename = media.file_name or "Unknown_File"
         
-        # New Name Logic
-        if mode == "caption" and message.caption:
+        # --- SMART RENAMING ---
+        # Use caption if mode is 'caption' OR if filename is junk (starts with 'out_'/'VID_')
+        is_junk = original_filename.startswith(("out_", "VID_", "TMP_"))
+        
+        if (mode == "caption" and message.caption) or (is_junk and message.caption):
             base_name = message.caption
         else:
             base_name = os.path.splitext(original_filename)[0]
@@ -243,7 +244,7 @@ async def process_file(client, message):
         new_filename = f"{base_name}{suffix}{extension}"
         final_path = os.path.join("downloads", new_filename)
         
-        # --- DOWNLOAD WITH PROGRESS BAR ---
+        # --- DOWNLOAD ---
         start_time = time.time()
         path = await message.download(
             file_name=final_path,
@@ -251,29 +252,33 @@ async def process_file(client, message):
             progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
         )
 
-        # PDF Logic
-        if extension.lower() == ".pdf":
-            wm_text = user_data.get("watermark_text")
-            if wm_text:
-                await status_msg.edit("📝 Applying PDF Watermark...\n(This might take a moment)")
-                wm_path = os.path.join("downloads", f"WM_{new_filename}")
-                success = await add_watermark(final_path, wm_path, wm_text)
-                if success:
-                    os.remove(final_path)
-                    final_path = wm_path
+        # PDF Watermark (Threaded to prevent freeze)
+        if extension.lower() == ".pdf" and user_data.get("watermark_text"):
+            await status_msg.edit("📝 **Applying Watermark...**")
+            wm_path = os.path.join("downloads", f"WM_{new_filename}")
+            loop = asyncio.get_running_loop()
+            success = await loop.run_in_executor(None, add_watermark_sync, final_path, wm_path, user_data.get("watermark_text"))
+            if success:
+                os.remove(final_path)
+                final_path = wm_path
 
-        await status_msg.edit("⬆️ **Preparing to Upload...**")
+        # --- THUMBNAIL LOGIC ---
+        thumb_source = "None"
+        if custom_thumb_id:
+            thumb_path = await client.download_media(custom_thumb_id)
+            thumb_source = "Custom"
+        elif message.video and message.video.thumbs:
+            thumb_path = await client.download_media(message.video.thumbs[0].file_id)
+            thumb_source = "Original"
 
         # Metadata
         duration, width, height = 0, 0, 0
-        if thumb_id:
-            thumb_path = await client.download_media(thumb_id)
-        
         if extension.lower() in [".mp4", ".mkv", ".avi", ".mov", ".webm"]:
             duration, width, height = get_metadata(final_path)
 
-        # --- UPLOAD WITH PROGRESS BAR ---
-        start_time = time.time() # Reset timer for upload
+        # --- UPLOAD ---
+        start_time = time.time()
+        upload_text = f"⬆️ **Uploading...**\n🖼️ Thumbnail: {thumb_source}"
         
         if extension.lower() in [".mp4", ".mkv"]:
              await client.send_video(
@@ -286,7 +291,7 @@ async def process_file(client, message):
                 height=height,
                 supports_streaming=True,
                 progress=progress_bar,
-                progress_args=(status_msg, "⬆️ **Uploading Video...**", start_time)
+                progress_args=(status_msg, upload_text, start_time)
             )
         else:
             await client.send_document(
@@ -296,15 +301,15 @@ async def process_file(client, message):
                 caption=new_filename,
                 force_document=True,
                 progress=progress_bar,
-                progress_args=(status_msg, "⬆️ **Uploading File...**", start_time)
+                progress_args=(status_msg, upload_text, start_time)
             )
 
         await status_msg.delete()
 
     except asyncio.CancelledError:
-        await status_msg.edit("❌ Cancelled.")
+        await status_msg.edit("❌ Process Cancelled.")
     except Exception as e:
-        await status_msg.edit(f"Error: {e}")
+        await status_msg.edit(f"⚠️ Error: {e}")
     finally:
         if final_path and os.path.exists(final_path): os.remove(final_path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
@@ -313,7 +318,7 @@ async def process_file(client, message):
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def incoming_file(client, message):
     if message.from_user.id in ongoing_tasks:
-        await message.reply_text("Wait for current process or /cancel.")
+        await message.reply_text("⏳ **Wait!** One process is already running.")
         return
 
     task = asyncio.create_task(process_file(client, message))
@@ -321,25 +326,7 @@ async def incoming_file(client, message):
     try: await task
     except asyncio.CancelledError: pass 
 
-# --- RUN BOT ---
-
-async def main():
-    await app.start()
-    print("Bot Started!")
-    
-    # SET COMMANDS IN MENU
-    await app.set_bot_commands([
-        BotCommand("start", "Start Bot"),
-        BotCommand("autoname", "Mode: Rename via Filename"),
-        BotCommand("autocaption", "Mode: Rename via Caption"),
-        BotCommand("suffix", "Set custom suffix"),
-        BotCommand("pdfmark", "Set PDF Watermark"),
-        BotCommand("delthumb", "Delete Thumbnail"),
-        BotCommand("cancel", "Cancel current task")
-    ])
-    
-    await idle()
-    await app.stop()
-
+# --- RUN ---
 if __name__ == "__main__":
-    app.run(main())
+    print("🤖 Bot Starting...")
+    app.run()
