@@ -2,11 +2,12 @@ import os
 import time
 import math
 import asyncio
-import re  # Added for Regex cleaning
+import re
 import aiofiles
 from io import BytesIO
 from pyrogram import Client, filters, idle, raw, utils
 from pyrogram.types import Message
+from pyrogram.errors import FloodWait, MessageNotModified
 from motor.motor_asyncio import AsyncIOMotorClient
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
@@ -79,6 +80,8 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
                
         await status_msg.edit(text)
         progress_bar.last_update_time = now
+    except MessageNotModified:
+        pass
     except Exception:
         pass
 
@@ -94,38 +97,59 @@ async def fast_download(client: Client, message: Message, file_path: str, status
     )
     return file_path
 
-# --- 3. SINGLE-THREADED UPLOAD ENGINE ---
+# --- 3. ROBUST UPLOAD ENGINE (FIXED) ---
 
 async def fast_upload(client: Client, file_path: str, status_msg, start_time):
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
     file_id = client.rnd_id()
     
-    CHUNK_SIZE = 2 * 1024 * 1024 # 2MB
+    # CHANGED: Reduced Chunk Size to 512KB for Stability on Heroku
+    CHUNK_SIZE = 512 * 1024 
     
     part_count = math.ceil(file_size / CHUNK_SIZE)
     uploaded_bytes = 0
     
     for part_index in range(part_count):
-        try:
-            async with aiofiles.open(file_path, "rb") as f:
-                await f.seek(part_index * CHUNK_SIZE)
-                chunk = await f.read(CHUNK_SIZE)
-            
-            await client.invoke(
-                raw.functions.upload.SaveBigFilePart(
-                    file_id=file_id,
-                    file_part=part_index,
-                    file_total_parts=part_count,
-                    bytes=chunk
+        # Retry loop for each chunk (max 3 retries)
+        retries = 3
+        while retries > 0:
+            try:
+                async with aiofiles.open(file_path, "rb") as f:
+                    await f.seek(part_index * CHUNK_SIZE)
+                    chunk = await f.read(CHUNK_SIZE)
+                
+                # Try uploading
+                await client.invoke(
+                    raw.functions.upload.SaveBigFilePart(
+                        file_id=file_id,
+                        file_part=part_index,
+                        file_total_parts=part_count,
+                        bytes=chunk
+                    )
                 )
-            )
-            
-            uploaded_bytes += len(chunk)
-            await progress_bar(uploaded_bytes, file_size, status_msg, "⬆️ **Uploading...**", start_time)
-            
-        except Exception as e:
-            raise e
+                
+                uploaded_bytes += len(chunk)
+                await progress_bar(uploaded_bytes, file_size, status_msg, "⬆️ **Uploading...**", start_time)
+                
+                # Success - break retry loop and move to next part
+                break 
+                
+            except FloodWait as e:
+                # If Telegram says wait, we wait
+                print(f"FloodWait: Sleeping {e.value}s")
+                await asyncio.sleep(e.value)
+                # Don't decrease retries for FloodWait, just retry
+                continue
+                
+            except Exception as e:
+                retries -= 1
+                print(f"Upload Error (Part {part_index}): {e}. Retrying... ({retries} left)")
+                await asyncio.sleep(2) # Wait 2s before retry
+                
+                if retries == 0:
+                    # If all retries failed, raise the error to cancel the process
+                    raise e
 
     return raw.types.InputFileBig(id=file_id, parts=part_count, name=file_name)
 
@@ -134,7 +158,6 @@ async def fast_upload(client: Client, file_path: str, status_msg, start_time):
 async def get_user(user_id):
     user = await users_col.find_one({"_id": user_id})
     if not user:
-        # Added "removal_words" list to default user schema
         user = {
             "_id": user_id, 
             "suffix": DEFAULT_SUFFIX, 
@@ -187,36 +210,24 @@ def add_watermark_sync(input_path, output_path, text):
         return True
     except: return False
 
-# --- NEW: TEXT CLEANER FUNCTION ---
+# --- TEXT CLEANER ---
 
 def clean_filename_text(text, removal_list):
     if not text: return "File"
-    
-    # 1. Remove User Custom Words (Case Insensitive)
     if removal_list:
         for word in removal_list:
-            # Escape the word to handle special chars like '.' or '*' safely
             pattern = re.compile(re.escape(word), re.IGNORECASE)
             text = pattern.sub("", text)
 
-    # 2. Remove Hindi (Devanagari Unicode Range)
     text = re.sub(r'[\u0900-\u097F]+', '', text)
-    
-    # 3. Remove Emojis & Pictographs
-    # Ranges: Emoticons, Symbols, Transport, Flags, Dingbats
     text = re.sub(r'[\U0001f600-\U0001f64f]', '', text) 
     text = re.sub(r'[\U0001f300-\U0001f5ff]', '', text) 
     text = re.sub(r'[\U0001f680-\U0001f6ff]', '', text) 
     text = re.sub(r'[\U0001f1e0-\U0001f1ff]', '', text) 
     text = re.sub(r'[\U00002700-\U000027bf]', '', text)
-    
-    # 4. Remove extra spaces and dots at start/end
     text = re.sub(r'\s+', ' ', text).strip()
     
-    # Ensure filename isn't empty after cleaning
-    if not text: 
-        text = "Media_File"
-        
+    if not text: text = "Media_File"
     return text
 
 # --- COMMANDS ---
@@ -242,27 +253,20 @@ async def set_suffix(client, message):
     await update_user(message.from_user.id, "suffix", new_suffix)
     await message.reply_text(f"✅ Suffix set to: `{new_suffix}`")
 
-# --- NEW COMMANDS FOR TEXT REMOVAL ---
-
 @app.on_message(filters.command("setremove") & filters.private)
 async def set_remove_words(client, message):
     if len(message.command) < 2:
-        await message.reply_text("ℹ️ Usage: `/setremove word1, word2, word3`\nExample: `/setremove @ChannelName, www.site.com`")
+        await message.reply_text("ℹ️ Usage: `/setremove word1, word2`")
         return
-    
-    # Split by comma and strip spaces
     words_raw = message.text.split(None, 1)[1]
     words_list = [w.strip() for w in words_raw.split(",")]
-    
     await update_user(message.from_user.id, "removal_words", words_list)
-    await message.reply_text(f"✅ **Removal List Updated:**\n`{words_list}`\n\nHindi & Emojis will also be removed automatically.")
+    await message.reply_text(f"✅ **Removal List Updated:**\n`{words_list}`")
 
 @app.on_message(filters.command("resetremove") & filters.private)
 async def reset_remove_words(client, message):
     await update_user(message.from_user.id, "removal_words", [])
     await message.reply_text("🗑️ **Removal List Cleared.**")
-
-# -------------------------------------
 
 @app.on_message(filters.command("pdfmark") & filters.private)
 async def set_pdf_mark(client, message):
@@ -350,7 +354,6 @@ async def process_file_logic(client, message):
         media = message.document or message.video or message.audio
         original_filename = media.file_name or "Unknown_File"
         
-        # Decide Base Name
         is_junk = original_filename.startswith(("out_", "VID_", "TMP_"))
         
         if (mode == "caption" and message.caption):
@@ -360,17 +363,13 @@ async def process_file_logic(client, message):
         else:
             base_name = os.path.splitext(original_filename)[0]
         
-        # --- APPLY CLEANER ---
-        # Cleans User Words + Hindi + Emojis
         base_name = clean_filename_text(base_name, removal_list)
-
         extension = os.path.splitext(original_filename)[1] or (".mp4" if message.video else ".mkv")
         new_filename = f"{base_name}{suffix}{extension}"
         final_path = os.path.join("downloads", new_filename)
         
         await status_msg.edit(f"⬇️ **Downloading:** `{new_filename}`")
         
-        # --- DOWNLOAD ---
         start_time = time.time()
         await fast_download(client, message, final_path, status_msg, start_time)
 
@@ -383,7 +382,6 @@ async def process_file_logic(client, message):
                 os.remove(final_path)
                 final_path = wm_path
 
-        # --- THUMBNAIL LOGIC ---
         if custom_thumb_id:
             thumb_path = await client.download_media(custom_thumb_id)
         elif message.video and message.video.thumbs:
@@ -393,7 +391,6 @@ async def process_file_logic(client, message):
         if extension.lower() in [".mp4", ".mkv", ".avi", ".mov", ".webm"]:
             duration, width, height = get_metadata(final_path)
 
-        # --- FAST UPLOAD ---
         start_time = time.time()
         uploaded_file = await fast_upload(client, final_path, status_msg, start_time)
         
@@ -435,5 +432,5 @@ async def incoming_file(client, message):
     await queue_handler(client, message)
 
 if __name__ == "__main__":
-    print("🤖 Bot Starting with Text Cleaner Engine...")
+    print("🤖 Bot Starting with Robust Engine...")
     app.run()
