@@ -14,7 +14,7 @@ from hachoir.parser import createParser
 API_ID = int(os.environ.get("API_ID", "123456")) 
 API_HASH = os.environ.get("API_HASH", "your_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_token")
-MONGO_URI = os.environ.get("MONGO_URI", "your_mongo_url")
+MONGO_URL = os.environ.get("MONGO_URI", "your_mongo_url")
 
 # --- DATABASE SETUP ---
 mongo = AsyncIOMotorClient(MONGO_URI)
