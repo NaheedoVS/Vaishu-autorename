@@ -2,6 +2,7 @@ import os
 import time
 import math
 import asyncio
+import re  # Added for Regex cleaning
 import aiofiles
 from io import BytesIO
 from pyrogram import Client, filters, idle, raw, utils
@@ -58,7 +59,6 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
         now = time.time()
         
         # --- STRICT 1 MINUTE TIMER ---
-        # Only update if 60 seconds have passed OR if the process is 100% complete
         if (now - progress_bar.last_update_time) < 60 and current != total:
             return
 
@@ -87,8 +87,6 @@ progress_bar.last_update_time = 0
 # --- 2. SINGLE-THREADED DOWNLOAD ENGINE ---
 
 async def fast_download(client: Client, message: Message, file_path: str, status_msg, start_time):
-    # Standard Pyrogram download is usually single-threaded and stable
-    # We removed the chunk/stream logic to ensure single-thread stability
     await message.download(
         file_name=file_path,
         progress=progress_bar,
@@ -103,20 +101,17 @@ async def fast_upload(client: Client, file_path: str, status_msg, start_time):
     file_name = os.path.basename(file_path)
     file_id = client.rnd_id()
     
-    # Chunk size can remain large for efficiency, but we process one at a time
     CHUNK_SIZE = 2 * 1024 * 1024 # 2MB
     
     part_count = math.ceil(file_size / CHUNK_SIZE)
     uploaded_bytes = 0
     
-    # Loop strictly sequentially
     for part_index in range(part_count):
         try:
             async with aiofiles.open(file_path, "rb") as f:
                 await f.seek(part_index * CHUNK_SIZE)
                 chunk = await f.read(CHUNK_SIZE)
             
-            # Upload the part
             await client.invoke(
                 raw.functions.upload.SaveBigFilePart(
                     file_id=file_id,
@@ -130,9 +125,6 @@ async def fast_upload(client: Client, file_path: str, status_msg, start_time):
             await progress_bar(uploaded_bytes, file_size, status_msg, "⬆️ **Uploading...**", start_time)
             
         except Exception as e:
-            print(f"Error uploading part {part_index}: {e}")
-            # In single thread, if one fails, the whole upload usually fails.
-            # You could add a retry loop here if needed.
             raise e
 
     return raw.types.InputFileBig(id=file_id, parts=part_count, name=file_name)
@@ -142,7 +134,15 @@ async def fast_upload(client: Client, file_path: str, status_msg, start_time):
 async def get_user(user_id):
     user = await users_col.find_one({"_id": user_id})
     if not user:
-        user = {"_id": user_id, "suffix": DEFAULT_SUFFIX, "mode": DEFAULT_MODE, "thumb": None, "watermark_text": "Protected"}
+        # Added "removal_words" list to default user schema
+        user = {
+            "_id": user_id, 
+            "suffix": DEFAULT_SUFFIX, 
+            "mode": DEFAULT_MODE, 
+            "thumb": None, 
+            "watermark_text": "Protected",
+            "removal_words": [] 
+        }
         await users_col.insert_one(user)
     return user
 
@@ -187,11 +187,43 @@ def add_watermark_sync(input_path, output_path, text):
         return True
     except: return False
 
+# --- NEW: TEXT CLEANER FUNCTION ---
+
+def clean_filename_text(text, removal_list):
+    if not text: return "File"
+    
+    # 1. Remove User Custom Words (Case Insensitive)
+    if removal_list:
+        for word in removal_list:
+            # Escape the word to handle special chars like '.' or '*' safely
+            pattern = re.compile(re.escape(word), re.IGNORECASE)
+            text = pattern.sub("", text)
+
+    # 2. Remove Hindi (Devanagari Unicode Range)
+    text = re.sub(r'[\u0900-\u097F]+', '', text)
+    
+    # 3. Remove Emojis & Pictographs
+    # Ranges: Emoticons, Symbols, Transport, Flags, Dingbats
+    text = re.sub(r'[\U0001f600-\U0001f64f]', '', text) 
+    text = re.sub(r'[\U0001f300-\U0001f5ff]', '', text) 
+    text = re.sub(r'[\U0001f680-\U0001f6ff]', '', text) 
+    text = re.sub(r'[\U0001f1e0-\U0001f1ff]', '', text) 
+    text = re.sub(r'[\U00002700-\U000027bf]', '', text)
+    
+    # 4. Remove extra spaces and dots at start/end
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Ensure filename isn't empty after cleaning
+    if not text: 
+        text = "Media_File"
+        
+    return text
+
 # --- COMMANDS ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("Hey! Send me files. I will queue them and rename them using Single-Threaded Stability! 🛡️")
+    await message.reply_text("Hey! I rename files.\n\nUse /setremove to filter out words!\nHindi & Emojis are removed automatically.")
 
 @app.on_message(filters.command("autoname") & filters.private)
 async def set_autoname(client, message):
@@ -209,6 +241,28 @@ async def set_suffix(client, message):
     new_suffix = " " + message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "suffix", new_suffix)
     await message.reply_text(f"✅ Suffix set to: `{new_suffix}`")
+
+# --- NEW COMMANDS FOR TEXT REMOVAL ---
+
+@app.on_message(filters.command("setremove") & filters.private)
+async def set_remove_words(client, message):
+    if len(message.command) < 2:
+        await message.reply_text("ℹ️ Usage: `/setremove word1, word2, word3`\nExample: `/setremove @ChannelName, www.site.com`")
+        return
+    
+    # Split by comma and strip spaces
+    words_raw = message.text.split(None, 1)[1]
+    words_list = [w.strip() for w in words_raw.split(",")]
+    
+    await update_user(message.from_user.id, "removal_words", words_list)
+    await message.reply_text(f"✅ **Removal List Updated:**\n`{words_list}`\n\nHindi & Emojis will also be removed automatically.")
+
+@app.on_message(filters.command("resetremove") & filters.private)
+async def reset_remove_words(client, message):
+    await update_user(message.from_user.id, "removal_words", [])
+    await message.reply_text("🗑️ **Removal List Cleared.**")
+
+# -------------------------------------
 
 @app.on_message(filters.command("pdfmark") & filters.private)
 async def set_pdf_mark(client, message):
@@ -282,7 +336,7 @@ async def process_queue(client, user_id):
 
 async def process_file_logic(client, message):
     user_id = message.from_user.id
-    status_msg = await message.reply_text(f"⬇️ **Starting File:** `{message.document.file_name if message.document else 'Video'}`")
+    status_msg = await message.reply_text(f"⬇️ **Starting...**")
     final_path = None
     thumb_path = None
     
@@ -291,23 +345,33 @@ async def process_file_logic(client, message):
         suffix = user_data.get("suffix", DEFAULT_SUFFIX)
         mode = user_data.get("mode", DEFAULT_MODE)
         custom_thumb_id = user_data.get("thumb")
+        removal_list = user_data.get("removal_words", [])
 
         media = message.document or message.video or message.audio
         original_filename = media.file_name or "Unknown_File"
         
+        # Decide Base Name
         is_junk = original_filename.startswith(("out_", "VID_", "TMP_"))
-        if (mode == "caption" and message.caption) or (is_junk and message.caption):
+        
+        if (mode == "caption" and message.caption):
+            base_name = message.caption
+        elif (is_junk and message.caption):
             base_name = message.caption
         else:
             base_name = os.path.splitext(original_filename)[0]
-            
+        
+        # --- APPLY CLEANER ---
+        # Cleans User Words + Hindi + Emojis
+        base_name = clean_filename_text(base_name, removal_list)
+
         extension = os.path.splitext(original_filename)[1] or (".mp4" if message.video else ".mkv")
         new_filename = f"{base_name}{suffix}{extension}"
         final_path = os.path.join("downloads", new_filename)
         
+        await status_msg.edit(f"⬇️ **Downloading:** `{new_filename}`")
+        
         # --- DOWNLOAD ---
         start_time = time.time()
-        # Single-Threaded download
         await fast_download(client, message, final_path, status_msg, start_time)
 
         if extension.lower() == ".pdf" and user_data.get("watermark_text"):
@@ -331,7 +395,6 @@ async def process_file_logic(client, message):
 
         # --- FAST UPLOAD ---
         start_time = time.time()
-        # Single-Threaded Upload
         uploaded_file = await fast_upload(client, final_path, status_msg, start_time)
         
         await status_msg.edit("🔄 **Processing Final File...**")
@@ -372,5 +435,5 @@ async def incoming_file(client, message):
     await queue_handler(client, message)
 
 if __name__ == "__main__":
-    print("🤖 Bot Starting with Single-Threaded Engine...")
+    print("🤖 Bot Starting with Text Cleaner Engine...")
     app.run()
