@@ -1,4 +1,6 @@
 import os
+import time
+import math
 import asyncio
 from io import BytesIO
 from pyrogram import Client, filters, idle
@@ -14,7 +16,7 @@ from hachoir.parser import createParser
 API_ID = int(os.environ.get("API_ID", "123456")) 
 API_HASH = os.environ.get("API_HASH", "your_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_token")
-MONGO_URL = os.environ.get("MONGO_URL", "your_mongo_url")
+MONGO_URL = os.environ.get("MONGO_URL", "your_mongo_url") # <--- Kept as MONGO_URL
 
 # --- DATABASE SETUP ---
 mongo = AsyncIOMotorClient(MONGO_URL)
@@ -29,9 +31,55 @@ DEFAULT_SUFFIX = " 🦋Vaiᡣ𐭩Su×@pglinsan2"
 DEFAULT_MODE = "filename"
 ongoing_tasks = {} 
 
-# --- CRITICAL FIX: CREATE FOLDER ---
 if not os.path.isdir("downloads"):
     os.makedirs("downloads")
+
+# --- PROGRESS BAR FUNCTIONS ---
+
+def humanbytes(size):
+    if not size: return ""
+    power = 2**10
+    n = 0
+    dic_powerN = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
+    while size > power:
+        size /= power
+        n += 1
+    return str(round(size, 2)) + " " + dic_powerN[n] + 'B'
+
+def time_formatter(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {seconds}s"
+
+async def progress_bar(current, total, status_msg, action_text, start_time):
+    try:
+        now = time.time()
+        # Update only every 5 seconds to avoid FloodWait (Telegram limit)
+        if (now - progress_bar.last_update_time) < 5 and current != total:
+            return
+
+        percentage = current * 100 / total
+        speed = current / (now - start_time) if (now - start_time) > 0 else 1
+        eta = (total - current) / speed if speed > 0 else 0
+        
+        # Draw Bar
+        bar_length = 10
+        filled_length = int(bar_length * percentage / 100)
+        bar = '■' * filled_length + '□' * (bar_length - filled_length)
+        
+        text = f"{action_text}\n\n" \
+               f"**[{bar}]** {round(percentage, 2)}%\n" \
+               f"⚡ **Speed:** {humanbytes(speed)}/s\n" \
+               f"⏱️ **ETA:** {time_formatter(eta)}\n" \
+               f"📦 **Size:** {humanbytes(current)} / {humanbytes(total)}"
+               
+        await status_msg.edit(text)
+        progress_bar.last_update_time = now
+    except Exception:
+        pass
+
+# Initialize static variable for progress bar
+progress_bar.last_update_time = 0
 
 # --- HELPERS ---
 
@@ -82,6 +130,7 @@ def create_watermark(text):
 
 async def add_watermark(input_path, output_path, text):
     try:
+        # NOTE: This is blocking. For large PDFs, consider running in executor (as discussed before)
         watermark_pdf = create_watermark(text)
         watermark_page = watermark_pdf.pages[0]
         reader = PdfReader(input_path)
@@ -105,12 +154,22 @@ async def start(client, message):
 @app.on_message(filters.command("autoname") & filters.private)
 async def set_autoname(client, message):
     await update_user(message.from_user.id, "mode", "filename")
-    await message.reply_text("✅ Mode set: **Auto Rename from Filename**\n(I will keep the original name + your suffix)")
+    # CONFIRMATION MESSAGE
+    await message.reply_text(
+        "✅ **Settings Updated Successfully!**\n\n"
+        "**Mode:** Auto Rename from Filename\n"
+        "**Action:** I will keep the original filename and append your suffix."
+    )
 
 @app.on_message(filters.command("autocaption") & filters.private)
 async def set_autocaption(client, message):
     await update_user(message.from_user.id, "mode", "caption")
-    await message.reply_text("✅ Mode set: **Auto Rename from Caption**\n(I will use the caption as the new filename)")
+    # CONFIRMATION MESSAGE
+    await message.reply_text(
+        "✅ **Settings Updated Successfully!**\n\n"
+        "**Mode:** Auto Rename from Caption\n"
+        "**Action:** I will use the file's caption as the new filename."
+    )
 
 @app.on_message(filters.command("suffix") & filters.private)
 async def set_suffix(client, message):
@@ -119,7 +178,7 @@ async def set_suffix(client, message):
         return
     new_suffix = " " + message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "suffix", new_suffix)
-    await message.reply_text(f"Suffix updated to: `{new_suffix}`")
+    await message.reply_text(f"✅ Suffix updated to: `{new_suffix}`")
 
 @app.on_message(filters.command("pdfmark") & filters.private)
 async def set_pdf_mark(client, message):
@@ -128,7 +187,7 @@ async def set_pdf_mark(client, message):
         return
     text = message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "watermark_text", text)
-    await message.reply_text(f"PDF Watermark text set to: `{text}`")
+    await message.reply_text(f"✅ PDF Watermark text set to: `{text}`")
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_process(client, message):
@@ -147,18 +206,18 @@ async def cancel_process(client, message):
 @app.on_message(filters.photo & filters.private)
 async def save_thumbnail(client, message):
     await update_user(message.from_user.id, "thumb", message.photo.file_id)
-    await message.reply_text("Thumbnail saved!")
+    await message.reply_text("✅ Thumbnail saved successfully!")
 
 @app.on_message(filters.command("delthumb") & filters.private)
 async def delete_thumbnail(client, message):
     await update_user(message.from_user.id, "thumb", None)
-    await message.reply_text("Thumbnail deleted.")
+    await message.reply_text("🗑️ Thumbnail deleted.")
 
 # --- CORE LOGIC ---
 
 async def process_file(client, message):
     user_id = message.from_user.id
-    status_msg = await message.reply_text("⬇️ Downloading...")
+    status_msg = await message.reply_text("⬇️ **Initiating Download...**")
     final_path = None
     thumb_path = None
     
@@ -184,21 +243,26 @@ async def process_file(client, message):
         new_filename = f"{base_name}{suffix}{extension}"
         final_path = os.path.join("downloads", new_filename)
         
-        # Download
-        path = await message.download(file_name=final_path)
+        # --- DOWNLOAD WITH PROGRESS BAR ---
+        start_time = time.time()
+        path = await message.download(
+            file_name=final_path,
+            progress=progress_bar,
+            progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
+        )
 
         # PDF Logic
         if extension.lower() == ".pdf":
             wm_text = user_data.get("watermark_text")
             if wm_text:
-                await status_msg.edit("📝 Applying PDF Watermark...")
+                await status_msg.edit("📝 Applying PDF Watermark...\n(This might take a moment)")
                 wm_path = os.path.join("downloads", f"WM_{new_filename}")
                 success = await add_watermark(final_path, wm_path, wm_text)
                 if success:
                     os.remove(final_path)
                     final_path = wm_path
 
-        await status_msg.edit("⬆️ Uploading...")
+        await status_msg.edit("⬆️ **Preparing to Upload...**")
 
         # Metadata
         duration, width, height = 0, 0, 0
@@ -208,7 +272,9 @@ async def process_file(client, message):
         if extension.lower() in [".mp4", ".mkv", ".avi", ".mov", ".webm"]:
             duration, width, height = get_metadata(final_path)
 
-        # Send
+        # --- UPLOAD WITH PROGRESS BAR ---
+        start_time = time.time() # Reset timer for upload
+        
         if extension.lower() in [".mp4", ".mkv"]:
              await client.send_video(
                 chat_id=message.chat.id,
@@ -218,7 +284,9 @@ async def process_file(client, message):
                 duration=duration,
                 width=width,
                 height=height,
-                supports_streaming=True
+                supports_streaming=True,
+                progress=progress_bar,
+                progress_args=(status_msg, "⬆️ **Uploading Video...**", start_time)
             )
         else:
             await client.send_document(
@@ -226,7 +294,9 @@ async def process_file(client, message):
                 document=final_path,
                 thumb=thumb_path,
                 caption=new_filename,
-                force_document=True
+                force_document=True,
+                progress=progress_bar,
+                progress_args=(status_msg, "⬆️ **Uploading File...**", start_time)
             )
 
         await status_msg.delete()
