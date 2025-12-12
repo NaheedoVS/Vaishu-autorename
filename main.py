@@ -13,7 +13,6 @@ from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
 # --- CONFIGURATION ---
-# Load variables. If missing, it will crash safely instead of using fake URLs.
 API_ID = int(os.environ.get("API_ID", "0")) 
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -30,7 +29,10 @@ app = Client("rename_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 # --- GLOBAL VARS ---
 DEFAULT_SUFFIX = " 🦋Vaiᡣ𐭩Su×@pglinsan2"
 DEFAULT_MODE = "filename"
-ongoing_tasks = {} 
+
+# --- QUEUE SYSTEM VARS ---
+QUEUE = {} # {user_id: [message_list]}
+CURRENT_TASK = {} # {user_id: asyncio.Task}
 
 if not os.path.isdir("downloads"):
     os.makedirs("downloads")
@@ -55,7 +57,6 @@ def time_formatter(seconds):
 async def progress_bar(current, total, status_msg, action_text, start_time):
     try:
         now = time.time()
-        # Update every 5 seconds
         if (now - progress_bar.last_update_time) < 5 and current != total:
             return
 
@@ -104,16 +105,13 @@ def get_metadata(file_path):
         if not parser: return 0, 0, 0
         metadata = extractMetadata(parser)
         if not metadata: return 0, 0, 0
-        
         duration = metadata.get("duration").seconds if metadata.has("duration") else 0
         width = metadata.get("width") if metadata.has("width") else 0
         height = metadata.get("height") if metadata.has("height") else 0
-            
         return duration, width, height
     except:
         return 0, 0, 0
 
-# Sync function for Threading
 def add_watermark_sync(input_path, output_path, text):
     try:
         packet = BytesIO()
@@ -145,7 +143,7 @@ def add_watermark_sync(input_path, output_path, text):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("Hey! I am ready. Send me a file.")
+    await message.reply_text("Hey! Send me files. I will queue them and rename them one by one.")
 
 @app.on_message(filters.command("autoname") & filters.private)
 async def set_autoname(client, message):
@@ -180,42 +178,94 @@ async def delete_thumbnail(client, message):
     await update_user(message.from_user.id, "thumb", None)
     await message.reply_text("🗑️ **Thumbnail Deleted.**\nI will now use the original video's thumbnail.")
 
-@app.on_message(filters.command("viewthumb") & filters.private)
-async def view_thumbnail(client, message):
-    user_data = await get_user(message.from_user.id)
-    thumb_id = user_data.get("thumb")
-    if thumb_id:
-        await client.send_photo(chat_id=message.chat.id, photo=thumb_id, caption="🖼️ This is your custom thumbnail.")
-    else:
-        await message.reply_text("❌ You have no custom thumbnail set.\n(I am using the original file's thumbnail).")
-
-# --- SAVE THUMBNAIL (Photo Handler) ---
 @app.on_message(filters.photo & filters.private)
 async def save_thumbnail(client, message):
-    # This captures PHOTOS sent to the bot
     await update_user(message.from_user.id, "thumb", message.photo.file_id)
-    await message.reply_text(
-        "✅ **Thumbnail Saved!**\n\n"
-        "I will use this photo for all future uploads.\n"
-        "To delete it, use /delthumb"
-    )
+    await message.reply_text("✅ **Thumbnail Saved!**")
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_process(client, message):
-    if message.from_user.id in ongoing_tasks:
-        try:
-            ongoing_tasks[message.from_user.id].cancel()
-        except: pass
-        del ongoing_tasks[message.from_user.id]
-        await message.reply_text("❌ Task Cancelled.")
-    else:
-        await message.reply_text("No active task.")
-
-# --- CORE LOGIC ---
-
-async def process_file(client, message):
     user_id = message.from_user.id
-    status_msg = await message.reply_text("⬇️ **Initiating...**")
+    # Check if a task is running
+    if user_id in CURRENT_TASK:
+        try:
+            CURRENT_TASK[user_id].cancel()
+            del CURRENT_TASK[user_id]
+            await message.reply_text("⏭️ **Skipped current file!** Checking queue for next...")
+        except: pass
+    else:
+        await message.reply_text("No active process to cancel.")
+    
+    # If there are items in queue, the 'finally' block in process_queue will trigger the next one.
+
+@app.on_message(filters.command("clear") & filters.private)
+async def clear_queue(client, message):
+    user_id = message.from_user.id
+    if user_id in QUEUE:
+        QUEUE[user_id] = []
+    await message.reply_text("🗑️ **Queue Cleared!**")
+
+# --- QUEUE MANAGER ---
+
+async def queue_handler(client, message):
+    user_id = message.from_user.id
+    
+    # Init Queue if not exists
+    if user_id not in QUEUE:
+        QUEUE[user_id] = []
+        
+    # Add message to queue
+    QUEUE[user_id].append(message)
+    
+    # If no task is currently running for this user, start processing
+    if user_id not in CURRENT_TASK:
+        # Start the loop
+        task = asyncio.create_task(process_queue(client, user_id))
+        CURRENT_TASK[user_id] = task
+        # We don't reply here to avoid spamming "Added to queue" for 100 files
+    else:
+        # Optional: Reply if queue length is significant
+        q_len = len(QUEUE[user_id])
+        if q_len % 5 == 0: # Only notify every 5 files to prevent flood
+            temp_msg = await message.reply_text(f"🗂️ Added to Queue: **#{q_len}**")
+            await asyncio.sleep(3)
+            await temp_msg.delete()
+
+async def process_queue(client, user_id):
+    # Loop while there are items in the queue
+    while user_id in QUEUE and len(QUEUE[user_id]) > 0:
+        
+        # Get next message (First In, First Out)
+        message = QUEUE[user_id][0] 
+        
+        try:
+            # PROCESS THE FILE
+            await process_file_logic(client, message)
+        except Exception as e:
+            print(f"Task Failed: {e}")
+            try:
+                await message.reply_text(f"❌ Failed to process file: {e}")
+            except: pass
+        finally:
+            # Remove processed message from queue
+            if user_id in QUEUE and len(QUEUE[user_id]) > 0:
+                QUEUE[user_id].pop(0) 
+            
+            # Small delay between files
+            await asyncio.sleep(1)
+
+    # Cleanup when queue is empty
+    if user_id in CURRENT_TASK:
+        del CURRENT_TASK[user_id]
+    if user_id in QUEUE:
+        del QUEUE[user_id]
+        await client.send_message(user_id, "✅ **All files in queue processed!**")
+
+# --- CORE LOGIC (Renamed to process_file_logic) ---
+
+async def process_file_logic(client, message):
+    user_id = message.from_user.id
+    status_msg = await message.reply_text(f"⬇️ **Starting File:** `{message.document.file_name if message.document else 'Video'}`")
     final_path = None
     thumb_path = None
     
@@ -229,7 +279,6 @@ async def process_file(client, message):
         original_filename = media.file_name or "Unknown_File"
         
         # --- SMART RENAMING ---
-        # Use caption if mode is 'caption' OR if filename is junk (starts with 'out_'/'VID_')
         is_junk = original_filename.startswith(("out_", "VID_", "TMP_"))
         
         if (mode == "caption" and message.caption) or (is_junk and message.caption):
@@ -252,7 +301,7 @@ async def process_file(client, message):
             progress_args=(status_msg, "⬇️ **Downloading...**", start_time)
         )
 
-        # PDF Watermark (Threaded to prevent freeze)
+        # PDF Watermark
         if extension.lower() == ".pdf" and user_data.get("watermark_text"):
             await status_msg.edit("📝 **Applying Watermark...**")
             wm_path = os.path.join("downloads", f"WM_{new_filename}")
@@ -278,7 +327,7 @@ async def process_file(client, message):
 
         # --- UPLOAD ---
         start_time = time.time()
-        upload_text = f"⬆️ **Uploading...**\n🖼️ Thumbnail: {thumb_source}"
+        upload_text = f"⬆️ **Uploading...**\nExample: `{new_filename}`\n🖼️ Thumb: {thumb_source}"
         
         if extension.lower() in [".mp4", ".mkv"]:
              await client.send_video(
@@ -307,24 +356,19 @@ async def process_file(client, message):
         await status_msg.delete()
 
     except asyncio.CancelledError:
-        await status_msg.edit("❌ Process Cancelled.")
+        # This catches the /cancel command
+        await status_msg.edit("❌ **Skipped/Cancelled.**")
+        raise asyncio.CancelledError # Re-raise to let the queue manager know
     except Exception as e:
         await status_msg.edit(f"⚠️ Error: {e}")
     finally:
         if final_path and os.path.exists(final_path): os.remove(final_path)
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-        if user_id in ongoing_tasks: del ongoing_tasks[user_id]
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def incoming_file(client, message):
-    if message.from_user.id in ongoing_tasks:
-        await message.reply_text("⏳ **Wait!** One process is already running.")
-        return
-
-    task = asyncio.create_task(process_file(client, message))
-    ongoing_tasks[message.from_user.id] = task
-    try: await task
-    except asyncio.CancelledError: pass 
+    # Instead of blocking, we add to queue
+    await queue_handler(client, message)
 
 # --- RUN ---
 if __name__ == "__main__":
