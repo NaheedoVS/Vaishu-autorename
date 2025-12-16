@@ -16,6 +16,7 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0")) # Only this ID can grant access
 
 # --- DATABASE SETUP ---
 mongo = AsyncIOMotorClient(MONGO_URL)
@@ -34,7 +35,7 @@ CURRENT_TASK = {}
 if not os.path.isdir("downloads"):
     os.makedirs("downloads")
 
-# --- 1. PROGRESS BAR ---
+# --- PROGRESS BAR & HELPERS ---
 
 def humanbytes(size):
     if not size: return ""
@@ -81,15 +82,35 @@ async def progress_bar(current, total, status_msg, action_text, start_time):
 
 progress_bar.last_update_time = 0
 
-# --- 2. ROBUST UPLOAD WRAPPER (Standard Pyrogram) ---
+async def get_user(user_id):
+    user = await users_col.find_one({"_id": user_id})
+    if not user:
+        user = {
+            "_id": user_id, 
+            "suffix": DEFAULT_SUFFIX, 
+            "mode": DEFAULT_MODE, 
+            "thumb": None, 
+            "removal_words": [],
+            "authorized": (user_id == OWNER_ID) # Owner is auto-authorized
+        }
+        await users_col.insert_one(user)
+    return user
 
+async def update_user(user_id, key, value):
+    await users_col.update_one({"_id": user_id}, {"$set": {key: value}}, upsert=True)
+
+# Helper to check auth
+async def is_authorized(user_id):
+    if user_id == OWNER_ID: return True
+    user = await get_user(user_id)
+    return user.get("authorized", False)
+
+
+
+# --- ROBUST UPLOAD WRAPPER ---
 async def upload_file(client, message, file_path, thumb_path, caption, duration, width, height, status_msg, start_time):
-    """
-    Tries to upload the file using standard Pyrogram methods with retries for stability.
-    """
     retries = 3
     attempt = 0
-    
     while attempt < retries:
         try:
             attempt += 1
@@ -116,42 +137,20 @@ async def upload_file(client, message, file_path, thumb_path, caption, duration,
                     progress=progress_bar,
                     progress_args=(status_msg, "⬆️ **Uploading...**", start_time)
                 )
-            # If successful, break the loop
             return 
-            
         except FloodWait as e:
-            print(f"FloodWait: Sleeping {e.value}s")
             await status_msg.edit(f"😴 **Sleeping for {e.value}s (FloodWait)...**")
             await asyncio.sleep(e.value)
-            attempt -= 1 # FloodWait shouldn't count as a failed retry
+            attempt -= 1
             continue
-            
         except Exception as e:
-            print(f"Upload Attempt {attempt} Failed: {e}")
             if attempt < retries:
-                await status_msg.edit(f"⚠️ **Upload Failed (Attempt {attempt}/{retries}). Retrying...**\nError: `{e}`")
+                await status_msg.edit(f"⚠️ **Upload Failed. Retrying...**\nError: `{e}`")
                 await asyncio.sleep(5)
             else:
-                raise e # Re-raise error if all retries fail
+                raise e
 
-# --- HELPERS ---
-
-async def get_user(user_id):
-    user = await users_col.find_one({"_id": user_id})
-    if not user:
-        user = {
-            "_id": user_id, 
-            "suffix": DEFAULT_SUFFIX, 
-            "mode": DEFAULT_MODE, 
-            "thumb": None, 
-            "removal_words": [] 
-        }
-        await users_col.insert_one(user)
-    return user
-
-async def update_user(user_id, key, value):
-    await users_col.update_one({"_id": user_id}, {"$set": {key: value}}, upsert=True)
-
+# --- HELPER: FILE NAME CLEANING ---
 def get_metadata(file_path):
     try:
         parser = createParser(file_path)
@@ -171,7 +170,6 @@ def clean_filename_text(text, removal_list):
         for word in removal_list:
             pattern = re.compile(re.escape(word), re.IGNORECASE)
             text = pattern.sub("", text)
-
     text = re.sub(r'[\u0900-\u097F]+', '', text)
     text = re.sub(r'[\U0001f600-\U0001f64f]', '', text) 
     text = re.sub(r'[\U0001f300-\U0001f5ff]', '', text) 
@@ -179,28 +177,58 @@ def clean_filename_text(text, removal_list):
     text = re.sub(r'[\U0001f1e0-\U0001f1ff]', '', text) 
     text = re.sub(r'[\U00002700-\U000027bf]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    
     if not text: text = "Media_File"
     return text
 
-# --- COMMANDS ---
+# --- NEW OWNER COMMANDS ---
+
+@app.on_message(filters.command("auth") & filters.user(OWNER_ID))
+async def auth_user(client, message):
+    if len(message.command) != 2:
+        return await message.reply_text("ℹ️ Usage: `/auth UserID`")
+    try:
+        user_id = int(message.command[1])
+        await update_user(user_id, "authorized", True)
+        await message.reply_text(f"✅ User `{user_id}` has been authorized.")
+    except:
+        await message.reply_text("❌ Invalid ID.")
+
+@app.on_message(filters.command("unauth") & filters.user(OWNER_ID))
+async def unauth_user(client, message):
+    if len(message.command) != 2:
+        return await message.reply_text("ℹ️ Usage: `/unauth UserID`")
+    try:
+        user_id = int(message.command[1])
+        if user_id == OWNER_ID:
+            return await message.reply_text("❌ Cannot unauthorize Owner.")
+        await update_user(user_id, "authorized", False)
+        await message.reply_text(f"🚫 User `{user_id}` access revoked.")
+    except:
+        await message.reply_text("❌ Invalid ID.")
+
+# --- SETTINGS COMMANDS ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("Hey! I rename files.\n\nUse /setremove to filter out words!\nHindi & Emojis are removed automatically.")
+    if not await is_authorized(message.from_user.id):
+        return await message.reply_text(f"⛔ **Access Denied.**\nYour ID: `{message.from_user.id}`\nContact the owner to get access.")
+    await message.reply_text("👋 **Welcome Back!**\nSend me a file to rename it.")
 
 @app.on_message(filters.command("autoname") & filters.private)
 async def set_autoname(client, message):
+    if not await is_authorized(message.from_user.id): return
     await update_user(message.from_user.id, "mode", "filename")
     await message.reply_text("✅ **Mode Set:** Filename + Suffix")
 
 @app.on_message(filters.command("autocaption") & filters.private)
 async def set_autocaption(client, message):
+    if not await is_authorized(message.from_user.id): return
     await update_user(message.from_user.id, "mode", "caption")
     await message.reply_text("✅ **Mode Set:** Caption as Filename")
 
 @app.on_message(filters.command("suffix") & filters.private)
 async def set_suffix(client, message):
+    if not await is_authorized(message.from_user.id): return
     if len(message.command) < 2: return
     new_suffix = " " + message.text.split(None, 1)[1]
     await update_user(message.from_user.id, "suffix", new_suffix)
@@ -208,6 +236,7 @@ async def set_suffix(client, message):
 
 @app.on_message(filters.command("setremove") & filters.private)
 async def set_remove_words(client, message):
+    if not await is_authorized(message.from_user.id): return
     if len(message.command) < 2:
         await message.reply_text("ℹ️ Usage: `/setremove word1, word2`")
         return
@@ -218,21 +247,25 @@ async def set_remove_words(client, message):
 
 @app.on_message(filters.command("resetremove") & filters.private)
 async def reset_remove_words(client, message):
+    if not await is_authorized(message.from_user.id): return
     await update_user(message.from_user.id, "removal_words", [])
     await message.reply_text("🗑️ **Removal List Cleared.**")
 
 @app.on_message(filters.command("delthumb") & filters.private)
 async def delete_thumbnail(client, message):
+    if not await is_authorized(message.from_user.id): return
     await update_user(message.from_user.id, "thumb", None)
     await message.reply_text("🗑️ **Thumbnail Deleted.**")
 
 @app.on_message(filters.photo & filters.private)
 async def save_thumbnail(client, message):
+    if not await is_authorized(message.from_user.id): return
     await update_user(message.from_user.id, "thumb", message.photo.file_id)
     await message.reply_text("✅ **Thumbnail Saved!**")
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_process(client, message):
+    if not await is_authorized(message.from_user.id): return
     user_id = message.from_user.id
     if user_id in CURRENT_TASK:
         try:
@@ -245,12 +278,12 @@ async def cancel_process(client, message):
 
 @app.on_message(filters.command("clear") & filters.private)
 async def clear_queue(client, message):
+    if not await is_authorized(message.from_user.id): return
     user_id = message.from_user.id
     if user_id in QUEUE: QUEUE[user_id] = []
     await message.reply_text("🗑️ **Queue Cleared!**")
 
 # --- QUEUE MANAGER ---
-
 async def queue_handler(client, message):
     user_id = message.from_user.id
     if user_id not in QUEUE: QUEUE[user_id] = []
@@ -317,7 +350,6 @@ async def process_file_logic(client, message):
         await status_msg.edit(f"⬇️ **Downloading:** `{new_filename}`")
         
         start_time = time.time()
-        # Using standard download to avoid chunk issues
         await message.download(
             file_name=final_path,
             progress=progress_bar,
@@ -335,7 +367,6 @@ async def process_file_logic(client, message):
 
         start_time = time.time()
         
-        # Call the Robust Upload Wrapper
         await upload_file(client, message, final_path, thumb_path, new_filename, duration, width, height, status_msg, start_time)
         
         await status_msg.delete()
@@ -351,8 +382,13 @@ async def process_file_logic(client, message):
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
 async def incoming_file(client, message):
+    # --- AUTH CHECK ---
+    if not await is_authorized(message.from_user.id):
+        return await message.reply_text(f"⛔ **Access Denied.**\nYour ID: `{message.from_user.id}`\nContact the owner to get access.")
+    # ------------------
     await queue_handler(client, message)
 
 if __name__ == "__main__":
-    print("🤖 Bot Starting with Robust Standard Engine...")
+    print("🤖 Bot Starting with Owner-Only Auth...")
     app.run()
+
